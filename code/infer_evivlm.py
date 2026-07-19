@@ -16,6 +16,7 @@ defined as mean(prob_VL - prob_V), with respect to the input image.
 
 import argparse
 import glob
+import json
 import os
 import random
 from typing import Optional, Sequence, Tuple
@@ -28,6 +29,12 @@ from torch.utils.data import DataLoader
 import Config_SSL as config
 from Load_Dataset_val_SSL import ImageToImage2D_val, ValGenerator
 from nets.EviVLM import EviVLM
+from nets.causal_reasoning import (
+    PersistentKnowledgeGraph,
+    build_reasoning_graph,
+    export_reasoning_graph,
+    summarize_reasoning,
+)
 
 
 def parse_args():
@@ -85,6 +92,16 @@ def parse_args():
         "--no-text",
         action="store_true",
         help="Disable text conditioning and run the model with empty texts.",
+    )
+    parser.add_argument(
+        "--save-reasoning",
+        action="store_true",
+        help="Save SCM reasoning summaries plus full JSON/HTML/PNG graph files.",
+    )
+    parser.add_argument(
+        "--save-aggregate-kg",
+        action="store_true",
+        help="Save an aggregate knowledge graph over all processed inference samples.",
     )
     return parser.parse_args()
 
@@ -232,10 +249,26 @@ def compute_saliency(
     images: torch.Tensor,
     texts: Sequence[str],
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_reasoning: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[Sequence[dict]], Optional[dict]]:
     images = images.to(device).float().detach().requires_grad_(True)
     with torch.enable_grad():
-        prob_V, prob_L, prob_VL, evi_V, evi_L, evi_VL, loss_sim = model(images, list(texts))
+        if return_reasoning:
+            (
+                prob_V,
+                prob_L,
+                prob_VL,
+                evi_V,
+                evi_L,
+                evi_VL,
+                loss_sim,
+                reasoning_outputs,
+            ) = model(images, list(texts), return_reasoning=True)
+            reasoning_summaries = summarize_reasoning(reasoning_outputs)
+        else:
+            prob_V, prob_L, prob_VL, evi_V, evi_L, evi_VL, loss_sim = model(images, list(texts))
+            reasoning_summaries = None
+            reasoning_outputs = None
         score = (prob_VL - prob_V).mean()
         grads = torch.autograd.grad(score, images, retain_graph=False, create_graph=False)[0]
     saliency = grads.abs().max(dim=1)[0]
@@ -243,7 +276,14 @@ def compute_saliency(
     for i in range(saliency.shape[0]):
         saliency_maps.append(torch.from_numpy(normalize_map(saliency[i])))
     saliency_tensor = torch.stack(saliency_maps, dim=0)
-    return prob_V.detach(), prob_VL.detach(), loss_sim.detach(), saliency_tensor
+    return (
+        prob_V.detach(),
+        prob_VL.detach(),
+        loss_sim.detach(),
+        saliency_tensor,
+        reasoning_summaries,
+        reasoning_outputs,
+    )
 
 
 def run_inference(args):
@@ -292,6 +332,7 @@ def run_inference(args):
     logger_info(f"Reports: {report_excel if report_excel else 'none'}")
     logger_info(f"Output dir: {output_dir}")
 
+    aggregate_kg = PersistentKnowledgeGraph() if args.save_aggregate_kg else None
     processed = 0
     for batch_idx, (sampled_batch, names) in enumerate(loader, 1):
         images = sampled_batch["image"]
@@ -300,7 +341,22 @@ def run_inference(args):
         if args.no_text:
             texts = [""] * images.size(0)
 
-        prob_V, prob_VL, loss_sim, saliency = compute_saliency(model, images, texts, device)
+        (
+            prob_V,
+            prob_VL,
+            loss_sim,
+            saliency,
+            reasoning_summaries,
+            reasoning_outputs,
+        ) = compute_saliency(
+            model,
+            images,
+            texts,
+            device,
+            return_reasoning=args.save_reasoning,
+        )
+        if aggregate_kg is not None and reasoning_outputs is not None:
+            aggregate_kg.update_from_reasoning(reasoning_outputs, sample_names=names)
 
         for i in range(images.size(0)):
             image_bgr = to_uint8_image(images[i])
@@ -318,11 +374,23 @@ def run_inference(args):
             panel_path = os.path.join(output_dir, f"{base_name}_panel.png")
             pred_path = os.path.join(output_dir, f"{base_name}_pred.png")
             saliency_path = os.path.join(output_dir, f"{base_name}_saliency.png")
+            reasoning_path = os.path.join(output_dir, f"{base_name}_reasoning.json")
+            graph_prefix = os.path.join(output_dir, f"{base_name}_reasoning_graph")
 
             cv2.imwrite(panel_path, panel)
             cv2.imwrite(pred_path, (squeeze_prediction(prob_VL[i]) * 255.0).astype(np.uint8))
             saliency_overlay = make_heatmap_overlay(image_bgr, saliency[i].numpy())
             cv2.imwrite(saliency_path, saliency_overlay)
+            if reasoning_summaries is not None:
+                with open(reasoning_path, "w", encoding="utf-8") as f:
+                    json.dump(reasoning_summaries[i], f, indent=2)
+            if reasoning_outputs is not None:
+                graph = build_reasoning_graph(
+                    reasoning_outputs,
+                    sample_idx=i,
+                    sample_name=names[i],
+                )
+                export_reasoning_graph(graph, graph_prefix)
 
             logger_info(
                 f"Saved {base_name}: pred={pred_path}, panel={panel_path}, saliency={saliency_path}, sim_loss={loss_sim.item():.4f}"
@@ -330,7 +398,12 @@ def run_inference(args):
 
             processed += 1
             if args.max_samples is not None and processed >= args.max_samples:
+                if aggregate_kg is not None:
+                    aggregate_kg.save(os.path.join(output_dir, "aggregate_reasoning_kg"))
                 return
+
+    if aggregate_kg is not None:
+        aggregate_kg.save(os.path.join(output_dir, "aggregate_reasoning_kg"))
 
 
 def main():

@@ -11,6 +11,7 @@ import logging
 import os
 import random
 import time
+import argparse
 
 import Config_SSL as config
 import numpy as np
@@ -23,6 +24,7 @@ from torch.backends import cudnn
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from nets.EviVLM import EviVLM
+from nets.causal_reasoning import PersistentKnowledgeGraph
 from utils_train import (
     CosineAnnealingWarmRestarts,
     WeightedDiceBCE,
@@ -62,6 +64,9 @@ def train_one_epoch(
     scaler,
     device,
     lambda_sim=1.0,
+    enable_reasoning=False,
+    lambda_reasoning=0.05,
+    persistent_kg=None,
 ):
     model.train()
     loss_sum, dice_sum, iou_sum = 0, 0, 0
@@ -75,9 +80,29 @@ def train_one_epoch(
 
         optimizer.zero_grad()
         # Keep the multimodal forward pass in float32 for stability.
-        prob_V, prob_L, prob_VL, evi_V, evi_L, evi_VL, loss_sim = model(images, texts)
+        if enable_reasoning:
+            (
+                prob_V,
+                prob_L,
+                prob_VL,
+                evi_V,
+                evi_L,
+                evi_VL,
+                loss_sim,
+                reasoning_outputs,
+            ) = model(images, texts, return_reasoning=True)
+        else:
+            prob_V, prob_L, prob_VL, evi_V, evi_L, evi_VL, loss_sim = model(images, texts)
+            reasoning_outputs = None
         seg_loss = criterion(prob_VL, masks.float())
         total_loss = seg_loss + lambda_sim * loss_sim
+        if reasoning_outputs is not None:
+            total_loss = (
+                total_loss
+                + lambda_reasoning * reasoning_outputs["causal_consistency_loss"]
+            )
+            if persistent_kg is not None:
+                persistent_kg.update_from_reasoning(reasoning_outputs, sample_names=names)
 
         if torch.isnan(total_loss):
             logger.error(f"NaN loss detected at Epoch {epoch + 1}, batch {i}. Skipping...")
@@ -109,7 +134,16 @@ def train_one_epoch(
         lr_scheduler.step()
 
 
-def validate(loader, model, criterion, epoch, logger, device, visualize_path):
+def validate(
+    loader,
+    model,
+    criterion,
+    epoch,
+    logger,
+    device,
+    visualize_path,
+    enable_reasoning=False,
+):
     model.eval()
     loss_sum, dice_sum, iou_sum = 0, 0, 0
 
@@ -119,7 +153,19 @@ def validate(loader, model, criterion, epoch, logger, device, visualize_path):
             texts = sampled_batch.get("text", [""] * images.size(0))
             images, masks = images.to(device), masks.to(device)
 
-            prob_V, prob_L, prob_VL, evi_V, evi_L, evi_VL, loss_sim = model(images, texts)
+            if enable_reasoning:
+                (
+                    prob_V,
+                    prob_L,
+                    prob_VL,
+                    evi_V,
+                    evi_L,
+                    evi_VL,
+                    loss_sim,
+                    reasoning_outputs,
+                ) = model(images, texts, return_reasoning=True)
+            else:
+                prob_V, prob_L, prob_VL, evi_V, evi_L, evi_VL, loss_sim = model(images, texts)
             seg_loss = criterion(prob_VL, masks.float())
 
             val_dice = criterion._show_dice(prob_VL, masks.float())
@@ -145,7 +191,46 @@ def validate(loader, model, criterion, epoch, logger, device, visualize_path):
     return avg_loss, avg_dice
 
 
-def main(report_excel_path=None, lambda_sim=0.1):
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train EviVLM with optional SCM reasoning")
+    parser.add_argument(
+        "--report-excel",
+        type=str,
+        default=None,
+        help="Excel file mapping image filenames to clinical report text.",
+    )
+    parser.add_argument(
+        "--lambda-sim",
+        type=float,
+        default=0.1,
+        help="Weight for the existing image-text similarity loss.",
+    )
+    parser.add_argument(
+        "--enable-reasoning",
+        action="store_true",
+        help="Enable the SCM reasoning branch and add causal consistency loss.",
+    )
+    parser.add_argument(
+        "--lambda-reasoning",
+        type=float,
+        default=0.05,
+        help="Weight for SCM causal consistency loss when reasoning is enabled.",
+    )
+    parser.add_argument(
+        "--save-kg",
+        action="store_true",
+        help="Save a persistent aggregate clinical-visual KG after training.",
+    )
+    return parser.parse_args()
+
+
+def main(
+    report_excel_path=None,
+    lambda_sim=0.1,
+    enable_reasoning=False,
+    lambda_reasoning=0.05,
+    save_kg=False,
+):
     task_name = "ImageEncoder_Pretrain"
     model_name = "EviVLM"
     session_name = "Pretrain_EviVLM_" + time.strftime("%m.%d_%Hh%M")
@@ -208,6 +293,9 @@ def main(report_excel_path=None, lambda_sim=0.1):
 
     max_dice = 0.0
     best_epoch = 0
+    persistent_kg = PersistentKnowledgeGraph() if enable_reasoning and save_kg else None
+    if save_kg and not enable_reasoning:
+        logger.info("Requested --save-kg without --enable-reasoning; KG export is disabled.")
 
     for epoch in range(config.epochs):
         logger.info(f"\n========= Epoch [{epoch + 1}/{config.epochs}] =========")
@@ -224,9 +312,19 @@ def main(report_excel_path=None, lambda_sim=0.1):
             scaler,
             device,
             lambda_sim=lambda_sim,
+            enable_reasoning=enable_reasoning,
+            lambda_reasoning=lambda_reasoning,
+            persistent_kg=persistent_kg,
         )
         val_loss, val_dice = validate(
-            val_loader, model, criterion, epoch, logger, device, visualize_path
+            val_loader,
+            model,
+            criterion,
+            epoch,
+            logger,
+            device,
+            visualize_path,
+            enable_reasoning=enable_reasoning,
         )
 
         writer.add_scalar("Val/Loss", val_loss, epoch)
@@ -247,6 +345,12 @@ def main(report_excel_path=None, lambda_sim=0.1):
             logger.info("\t Early stopping triggered!")
             break
 
+    if persistent_kg is not None:
+        kg_dir = os.path.join(save_path, "reasoning_kg")
+        kg_prefix = os.path.join(kg_dir, "persistent_knowledge_graph")
+        saved_kg = persistent_kg.save(kg_prefix)
+        logger.info(f"Saved persistent KG: {saved_kg}")
+
 
 if __name__ == "__main__":
     cudnn.benchmark = False
@@ -255,12 +359,21 @@ if __name__ == "__main__":
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
 
+    args = parse_args()
+
     # By default look for a reports Excel in dataset root
     default_report_excel = "d:/VLM_Medical_Imaging/dataset/reports.xlsx"
-    if os.path.exists(default_report_excel):
+    if args.report_excel is not None:
+        report_path = args.report_excel
+    elif os.path.exists(default_report_excel):
         report_path = default_report_excel
     else:
         report_path = None
 
-    # lambda_sim can be tuned; default 0.1
-    main(report_excel_path=report_path, lambda_sim=0.1)
+    main(
+        report_excel_path=report_path,
+        lambda_sim=args.lambda_sim,
+        enable_reasoning=args.enable_reasoning,
+        lambda_reasoning=args.lambda_reasoning,
+        save_kg=args.save_kg,
+    )

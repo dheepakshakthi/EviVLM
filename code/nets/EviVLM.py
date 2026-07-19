@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from backbones.bert_model.TextEncoder import TextEncoder_Bert
+from nets.causal_reasoning import SCMReasoningHead
 from nets.unet_blocks import ConvBatchNorm, DownBlock, NLBlock, UpBlock
 
 
@@ -152,6 +153,7 @@ class EviVLM(nn.Module):
             self.last_activation = None
 
         self.text_encoder = TextEncoder_Bert()
+        self.causal_reasoner = SCMReasoningHead()
 
         self.V2L = nn.Sequential(
             # nn.Linear(64, 64),
@@ -181,7 +183,7 @@ class EviVLM(nn.Module):
             nn.Softmax(dim=1),
         )
 
-    def forward(self, x, texts):
+    def forward(self, x, texts, return_reasoning=False):
         b = x.shape[0]
         x = x.float()
         self.device = x.device
@@ -337,6 +339,26 @@ class EviVLM(nn.Module):
 
         # y = alpha_V
         # y = self.last_activation(y)
+
+        if return_reasoning:
+            reasoning_outputs = self.causal_reasoner(
+                word_emb=word_emb,
+                token_words=[sentence[1:] for sentence in sents],
+                patch_emb=patch_emb,
+                atten_scores=atten_scores,
+                seg_prob=prob_VL,
+                evidence=evi_VL,
+            )
+            return (
+                prob_V,
+                prob_L,
+                prob_VL,
+                evi_V,
+                evi_L,
+                evi_VL,
+                loss_sim,
+                reasoning_outputs,
+            )
 
         return prob_V, prob_L, prob_VL, evi_V, evi_L, evi_VL, loss_sim
 

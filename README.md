@@ -62,7 +62,81 @@ Notes:
 - If you have a different Excel layout, open `code/Load_Dataset_val_SSL.py` and adjust the `report_sheet`, `report_col_image`, or `report_col_text` arguments when constructing the dataset.
 
 **Next steps I can do for you**
-- Wire command-line arguments to `train_evivlm.py` for flexible paths and hyperparameters.
 - Add simple unit tests for dataset mapping and a small smoke test that runs one forward pass on CPU.
 
 If you want me to proceed with any of those, tell me which one.
+
+**Optional SCM reasoning branch**
+- The model now has an optional structural-causal reasoning branch in `code/nets/causal_reasoning.py`.
+- Existing calls still work unchanged:
+
+```python
+prob_V, prob_L, prob_VL, evi_V, evi_L, evi_VL, loss_sim = model(images, texts)
+```
+
+- To request reasoning outputs:
+
+```python
+prob_V, prob_L, prob_VL, evi_V, evi_L, evi_VL, loss_sim, reasoning = model(
+    images,
+    texts,
+    return_reasoning=True,
+)
+```
+
+- The reasoning output contains:
+  - `clinical_graph`: concept nodes built from ClinicalBERT tokens.
+  - `visual_graph`: region nodes built from the predicted mask and evidential uncertainty.
+  - `causal_edges`: SCM-style concept-to-region causal strengths.
+  - `attention_edges`: cross-attention-derived concept-to-region alignment.
+  - `causal_consistency_loss`: optional training loss.
+  - `reasoning_confidence`: per-sample reliability score.
+
+- To train with the reasoning loss enabled:
+
+```bash
+python code/train_evivlm.py --enable-reasoning --lambda-reasoning 0.05
+```
+
+- To train with reasoning and save a persistent post-training knowledge graph:
+
+```bash
+python code/train_evivlm.py --enable-reasoning --lambda-reasoning 0.05 --save-kg
+```
+
+- This saves the aggregate KG under the training run folder:
+
+```text
+ImageEncoder_Pretrain/EviVLM/<run_name>/reasoning_kg/persistent_knowledge_graph.json
+ImageEncoder_Pretrain/EviVLM/<run_name>/reasoning_kg/persistent_knowledge_graph.html
+ImageEncoder_Pretrain/EviVLM/<run_name>/reasoning_kg/persistent_knowledge_graph.png
+```
+
+- To save reasoning summaries during inference:
+
+```bash
+python code/infer_evivlm.py --checkpoint path/to/checkpoint.pth.tar --save-reasoning
+```
+
+- With `--save-reasoning`, each inference case saves:
+
+```text
+<case>_reasoning.json
+<case>_reasoning_graph.json
+<case>_reasoning_graph.html
+<case>_reasoning_graph.png
+```
+
+- To also save an aggregate KG over all processed inference cases:
+
+```bash
+python code/infer_evivlm.py --checkpoint path/to/checkpoint.pth.tar --save-reasoning --save-aggregate-kg
+```
+
+- This saves:
+
+```text
+aggregate_reasoning_kg.json
+aggregate_reasoning_kg.html
+aggregate_reasoning_kg.png
+```

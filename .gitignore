@@ -5,6 +5,7 @@ test.py
 /ImageEncoder_Pretrain/EviVLM/Pretrain_EviVLM_05.25_14h42/models/best_model-EviVLM.pth.tar
 /ImageEncoder_Pretrain/EviVLM/Pretrain_EviVLM_05.25_14h42/visualize_val
 /ImageEncoder_Pretrain/UNet/Pretrain_05.25_10h55/visualize_val
+/ImageEncoder_Pretrain/EviVLM/Pretrain_EviVLM_07.19_12h35
 
 /code/__pycache__
 /code/nets/__pycache__
